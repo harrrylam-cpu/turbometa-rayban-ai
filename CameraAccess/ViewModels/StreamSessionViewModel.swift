@@ -17,6 +17,9 @@
 import MWDATCamera
 import MWDATCore
 import SwiftUI
+import os.log
+
+private let logger = Logger(subsystem: "com.smartview.glassai", category: "StreamSession")
 
 enum StreamingStatus {
   case streaming
@@ -50,6 +53,7 @@ class StreamSessionViewModel: ObservableObject {
 
   private var timerTask: Task<Void, Never>?
   // The core DAT SDK StreamSession - handles all streaming operations
+  // IMPORTANT: SDK requires ONE session instance, reused with start()/stop()
   private var streamSession: StreamSession
   // Listener tokens are used to manage DAT SDK event subscriptions
   private var stateListenerToken: AnyListenerToken?
@@ -62,31 +66,48 @@ class StreamSessionViewModel: ObservableObject {
 
   init(wearables: WearablesInterface) {
     self.wearables = wearables
+    logger.info("🟢 StreamSessionViewModel init")
     // Let the SDK auto-select from available devices
     self.deviceSelector = AutoDeviceSelector(wearables: wearables)
+
+    // Get saved video quality setting from UserDefaults (only read at init)
+    let savedQuality = UserDefaults.standard.string(forKey: "video_quality") ?? "medium"
+    let resolution: StreamingResolution
+    switch savedQuality {
+    case "low":
+      resolution = .low
+    case "high":
+      resolution = .high
+    default:
+      resolution = .medium
+    }
+    logger.info("🟢 Using video quality: \(savedQuality) -> \(String(describing: resolution))")
+
+    // Create ONE session at init - SDK pattern requires reusing same session
     let config = StreamSessionConfig(
       videoCodec: VideoCodec.raw,
-      resolution: StreamingResolution.low,
+      resolution: resolution,
       frameRate: 24)
     streamSession = StreamSession(streamSessionConfig: config, deviceSelector: deviceSelector)
+    logger.info("🟢 StreamSession created")
 
     // Monitor device availability
     deviceMonitorTask = Task { @MainActor in
       for await device in deviceSelector.activeDeviceStream() {
+        logger.info("📱 Device changed: \(device != nil ? "connected" : "disconnected")")
         self.hasActiveDevice = device != nil
       }
     }
 
-    // Subscribe to session state changes using the DAT SDK listener pattern
-    // State changes tell us when streaming starts, stops, or encounters issues
+    // Subscribe to session state changes
     stateListenerToken = streamSession.statePublisher.listen { [weak self] state in
       Task { @MainActor [weak self] in
+        logger.info("📊 State changed: \(String(describing: state))")
         self?.updateStatusFromState(state)
       }
     }
 
-    // Subscribe to video frames from the device camera
-    // Each VideoFrame contains the raw camera data that we convert to UIImage
+    // Subscribe to video frames
     videoFrameListenerToken = streamSession.videoFramePublisher.listen { [weak self] videoFrame in
       Task { @MainActor [weak self] in
         guard let self else { return }
@@ -94,17 +115,18 @@ class StreamSessionViewModel: ObservableObject {
         if let image = videoFrame.makeUIImage() {
           self.currentVideoFrame = image
           if !self.hasReceivedFirstFrame {
+            logger.info("🎥 First frame received and converted")
             self.hasReceivedFirstFrame = true
           }
         }
       }
     }
 
-    // Subscribe to streaming errors
-    // Errors include device disconnection, streaming failures, etc.
+    // Subscribe to errors
     errorListenerToken = streamSession.errorPublisher.listen { [weak self] error in
       Task { @MainActor [weak self] in
         guard let self else { return }
+        logger.error("❌ Stream error: \(String(describing: error))")
         let newErrorMessage = formatStreamingError(error)
         if newErrorMessage != self.errorMessage {
           showError(newErrorMessage)
@@ -112,47 +134,59 @@ class StreamSessionViewModel: ObservableObject {
       }
     }
 
-    updateStatusFromState(streamSession.state)
-
-    // Subscribe to photo capture events
-    // PhotoData contains the captured image in the requested format (JPEG/HEIC)
+    // Subscribe to photo capture
     photoDataListenerToken = streamSession.photoDataPublisher.listen { [weak self] photoData in
       Task { @MainActor [weak self] in
         guard let self else { return }
+        logger.info("📸 Photo captured - size: \(photoData.data.count) bytes")
         if let uiImage = UIImage(data: photoData.data) {
           self.capturedPhoto = uiImage
           self.showPhotoPreview = true
         }
       }
     }
+
+    updateStatusFromState(streamSession.state)
+    logger.info("🟢 StreamSessionViewModel init complete")
   }
 
   func handleStartStreaming() async {
+    logger.info("▶️ handleStartStreaming called")
     let permission = Permission.camera
     do {
       let status = try await wearables.checkPermissionStatus(permission)
+      logger.info("▶️ Permission status: \(String(describing: status))")
       if status == .granted {
         await startSession()
         return
       }
       let requestStatus = try await wearables.requestPermission(permission)
+      logger.info("▶️ Permission request result: \(String(describing: requestStatus))")
       if requestStatus == .granted {
         await startSession()
         return
       }
       showError("Permission denied")
     } catch {
+      logger.error("❌ Permission error: \(error.localizedDescription)")
       showError("Permission error: \(error.description)")
     }
   }
 
   func startSession() async {
+    logger.info("🚀 startSession START")
+
     // Reset to unlimited time when starting a new stream
     activeTimeLimit = .noLimit
     remainingTime = 0
     stopTimer()
 
+    // Reset frame state
+    hasReceivedFirstFrame = false
+
+    logger.info("🚀 Calling session.start()...")
     await streamSession.start()
+    logger.info("🚀 startSession END - session.start() returned")
   }
 
   private func showError(_ message: String) {
@@ -161,8 +195,10 @@ class StreamSessionViewModel: ObservableObject {
   }
 
   func stopSession() async {
+    logger.info("⏹️ stopSession START")
     stopTimer()
     await streamSession.stop()
+    logger.info("⏹️ stopSession END")
   }
 
   func dismissError() {
@@ -210,13 +246,17 @@ class StreamSessionViewModel: ObservableObject {
   }
 
   private func updateStatusFromState(_ state: StreamSessionState) {
+    logger.info("📊 updateStatusFromState: \(String(describing: state)) -> streamingStatus update")
     switch state {
     case .stopped:
+      logger.info("📊 State is STOPPED - clearing frame")
       currentVideoFrame = nil
       streamingStatus = .stopped
     case .waitingForDevice, .starting, .stopping, .paused:
+      logger.info("📊 State is WAITING (\(String(describing: state)))")
       streamingStatus = .waiting
     case .streaming:
+      logger.info("📊 State is STREAMING ✅")
       streamingStatus = .streaming
     }
   }
@@ -240,5 +280,20 @@ class StreamSessionViewModel: ObservableObject {
     @unknown default:
       return "An unknown streaming error occurred."
     }
+  }
+
+  /// Full cleanup of all resources - call when ViewModel is no longer needed
+  func cleanup() async {
+    logger.info("🔴 cleanup START")
+    stopTimer()
+    deviceMonitorTask?.cancel()
+    deviceMonitorTask = nil
+    await streamSession.stop()
+    // Clear listeners
+    stateListenerToken = nil
+    videoFrameListenerToken = nil
+    errorListenerToken = nil
+    photoDataListenerToken = nil
+    logger.info("🔴 cleanup END")
   }
 }
