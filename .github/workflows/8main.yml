@@ -55,3 +55,7 @@ jobs:
         with:
           name: TurboMeta-App
           path: TurboMeta.ipa
+
+          # Adding -y preserves Apple's framework symlinks
+zip -ry TurboMeta.ipa Payload
+
